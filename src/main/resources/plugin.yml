@@ -1,0 +1,5 @@
+name: LudoMania
+version: 1.0
+author: ExpertX_DA
+main: ru.ludomania.LudoPlugin
+api-version: 1.20
