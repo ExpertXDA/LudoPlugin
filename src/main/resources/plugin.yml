@@ -2,4 +2,5 @@ name: LudoMania
 version: 1.0
 author: ExpertX_DA
 main: ru.ludomania.LudoPlugin
+folia-supported: True
 api-version: 1.20
