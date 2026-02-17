@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="LudoPlugin:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/LudoPlugin_jar</output-path>
+    <root id="archive" name="LudoPlugin.jar">
+      <element id="module-output" name="LudoPlugin" />
+    </root>
+  </artifact>
+</component>

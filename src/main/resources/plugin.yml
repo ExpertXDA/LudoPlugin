@@ -1,6 +1,14 @@
 name: LudoMania
 version: 1.0
-author: ExpertX_DA
 main: ru.ludomania.LudoPlugin
-folia-supported: True
 api-version: 1.20
+folia-supported: true
+author: ExpertX_DA
+description: Плагин на лудоманию с бочками и ломкой для Folia.
+
+# Регистрация команд обязательна!
+commands:
+  ludo:
+    description: Посмотреть статус своей зависимости (сколько депнул и процент кайфа)
+    usage: /ludo
+    aliases: [ludostats, dep]
