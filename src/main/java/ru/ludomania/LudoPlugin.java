@@ -28,6 +28,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.ShapedRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.SkullMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -39,15 +40,22 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor {
 
     private final NamespacedKey BARREL_KEY = new NamespacedKey(this, "ludo_barrel");
     private final NamespacedKey PLACER_KEY = new NamespacedKey(this, "placer_uuid");
+    private final Component TOP_TITLE = Component.text("☠ ТОП ЛУДОМАНОВ ☠", NamedTextColor.DARK_RED, TextDecoration.BOLD);
 
     private final Map<UUID, LudoData> addicts = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledTask> playerTasks = new ConcurrentHashMap<>();
     private final Set<String> barrelLocations = ConcurrentHashMap.newKeySet();
+
+    // Настройки из конфига
+    private double highSpeedMultiplier = 1.0;      // Скорость кайфа
+    private double withdrawalSpeedMultiplier = 1.0; // Скорость ломки
+    private int minOreTrigger = 10;
 
     private final List<String> MESSAGES = List.of(
             "РУКИ ТРЯСУТСЯ...", "ГДЕ АРЫ?!", "МНЕ НУЖНО ЕЩЕ...",
@@ -79,7 +87,10 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         }, 40L, 40L);
 
         for (Player p : Bukkit.getOnlinePlayers()) {
-            if (addicts.containsKey(p.getUniqueId())) startLudoTask(p);
+            if (addicts.containsKey(p.getUniqueId())) {
+                addicts.get(p.getUniqueId()).playerName = p.getName();
+                startLudoTask(p);
+            }
         }
     }
 
@@ -94,6 +105,10 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
     @EventHandler
     public void onInventoryClick(InventoryClickEvent e) {
         if (!(e.getWhoClicked() instanceof Player player)) return;
+        if (e.getView().title().equals(TOP_TITLE)) {
+            e.setCancelled(true);
+            return;
+        }
 
         Inventory clickedInv = e.getClickedInventory();
         Inventory topInv = e.getView().getTopInventory();
@@ -152,8 +167,6 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         }
     }
 
-    // --- ГЛАВНАЯ ФУНКЦИЯ ДЕПОЗИТА ---
-
     private boolean processDeposit(Player player, Barrel barrel, ItemStack stack) {
         String ownerUUID = barrel.getPersistentDataContainer().get(PLACER_KEY, PersistentDataType.STRING);
         if (ownerUUID != null && ownerUUID.equals(player.getUniqueId().toString())) {
@@ -168,7 +181,6 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         }
 
         org.bukkit.block.Hopper bankHopper = (org.bukkit.block.Hopper) bankBlock.getState();
-
         ItemStack toAdd = stack.clone();
         HashMap<Integer, ItemStack> leftOver = bankHopper.getInventory().addItem(toAdd);
 
@@ -179,12 +191,12 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
 
         int amount = stack.getAmount();
         LudoData data = addicts.getOrDefault(player.getUniqueId(), new LudoData());
+        data.playerName = player.getName();
 
         long currentTime = System.currentTimeMillis();
         boolean isAddicted = playerTasks.containsKey(player.getUniqueId()) || data.percentage > 0;
 
         if (!isAddicted) {
-            // Если с последнего депа прошло больше 10 минут (600 сек * 1000)
             if (currentTime - data.lastDepositTime > 600000) {
                 data.totalDeposited = 0;
             }
@@ -193,8 +205,7 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         data.totalDeposited += amount;
         data.lastDepositTime = currentTime;
 
-        // ПОРОГ ВХОДА: 10 РУДЫ
-        if (data.totalDeposited >= 10) {
+        if (data.totalDeposited >= minOreTrigger) {
             data.percentage = 100.0;
             addicts.put(player.getUniqueId(), data);
 
@@ -208,21 +219,23 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         } else {
             addicts.put(player.getUniqueId(), data);
             player.playSound(player.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1f, 2.0f);
-            player.sendActionBar(Component.text("Депозит принят (" + data.totalDeposited + "/10 для активации)", NamedTextColor.GRAY));
+            player.sendActionBar(Component.text("Депозит принят (" + data.totalDeposited + "/" + minOreTrigger + " для активации)", NamedTextColor.GRAY));
         }
 
         return true;
     }
 
     private boolean isValidOre(ItemStack item) {
-        return item != null && item.getType() == Material.DEEPSLATE_DIAMOND_ORE;
+        if (item == null) return false;
+        Material t = item.getType();
+        return t == Material.DIAMOND_ORE || t == Material.DEEPSLATE_DIAMOND_ORE;
     }
 
     private boolean isLudoBarrel(Barrel b) {
         return b.getPersistentDataContainer().has(BARREL_KEY, PersistentDataType.BYTE);
     }
 
-    // --- ЛОГИКА ЛОМКИ И ЭФФЕКТОВ ---
+    // --- ЛОГИКА ЛОМКИ (С НОВЫМИ НАСТРОЙКАМИ) ---
 
     private void startLudoTask(Player player) {
         ScheduledTask task = player.getScheduler().runAtFixedRate(this, (t) -> {
@@ -235,28 +248,32 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
 
             LudoData data = addicts.get(uid);
 
-            if (data.totalDeposited < 10) {
+            if (data.totalDeposited < minOreTrigger) {
                 t.cancel();
                 playerTasks.remove(uid);
                 return;
             }
 
             double decay;
+
+            // Если процент больше 20 - это фаза КАЙФА
             if (data.percentage > 20) {
-                decay = 0.4 + (data.totalDeposited / 2000.0);
-            } else {
-                decay = 0.5 / (1.0 + (data.totalDeposited / 300.0));
+                // Базовая формула + множитель скорости кайфа
+                double baseDecay = 0.4 + (data.totalDeposited / 2000.0);
+                decay = baseDecay * highSpeedMultiplier;
+            }
+            // Если процент меньше 20 - это фаза ЛОМКИ
+            else {
+                // Базовая формула + множитель скорости ломки
+                double baseDecay = 0.5 / (1.0 + (data.totalDeposited / 300.0));
+                decay = baseDecay * withdrawalSpeedMultiplier;
             }
 
             data.percentage -= decay;
 
             if (data.percentage <= 0) {
                 addicts.remove(uid);
-                player.showTitle(Title.title(
-                        Component.text("СВОБОДА..."),
-                        Component.text("Ты чист"),
-                        Title.Times.times(Duration.ofMillis(500), Duration.ofMillis(3000), Duration.ofMillis(1000))
-                ));
+                player.showTitle(Title.title(Component.text("СВОБОДА..."), Component.text("Ты чист"), Title.Times.times(Duration.ofMillis(500), Duration.ofMillis(3000), Duration.ofMillis(1000))));
                 player.sendMessage(Component.text("Ты переборол зависимость.", NamedTextColor.GREEN));
                 t.cancel();
                 playerTasks.remove(uid);
@@ -276,19 +293,15 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         int chance = ThreadLocalRandom.current().nextInt(100);
         int severity = total < 200 ? 0 : (total < 1000 ? 1 : 2);
 
-
         PotionEffect currentNausea = p.getPotionEffect(PotionEffectType.NAUSEA);
-
         if (currentNausea == null || currentNausea.getDuration() < 100) {
             p.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, 300, 0, false, false));
         }
 
-        // Слепота для средних и жестких (шанс 10%)
         if (severity >= 1 && chance < 10) {
             p.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 60, 0, false, false));
         }
 
-        // Рандомные приходы (5% в секунду)
         if (chance < 5) {
             String msg = MESSAGES.get(ThreadLocalRandom.current().nextInt(MESSAGES.size()));
             p.sendMessage(Component.text(msg, NamedTextColor.DARK_RED, TextDecoration.BOLD));
@@ -297,30 +310,32 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
             if (severity == 2) {
                 p.damage(1.0);
                 p.playSound(p.getLocation(), Sound.ENTITY_GHAST_SCREAM, 0.5f, 0.5f);
-                p.showTitle(Title.title(
-                        Component.text("☠", NamedTextColor.RED),
-                        Component.text("БОЛЬ НЕ УЙДЕТ", NamedTextColor.DARK_RED),
-                        Title.Times.times(Duration.ZERO, Duration.ofMillis(1000), Duration.ofMillis(500))
-                ));
+                p.showTitle(Title.title(Component.text("☠", NamedTextColor.RED), Component.text("БОЛЬ НЕ УЙДЕТ", NamedTextColor.DARK_RED), Title.Times.times(Duration.ZERO, Duration.ofMillis(1000), Duration.ofMillis(500))));
                 p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1, false, false));
                 p.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, 60, 1, false, false));
             }
         }
     }
 
-    // --- ОСТАЛЬНОЕ ---
+    // --- КОМАНДЫ И ТОП ---
 
     @Override
     public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
         if (!(sender instanceof Player player)) return true;
+
+        if (args.length > 0 && args[0].equalsIgnoreCase("top")) {
+            openTopGui(player);
+            return true;
+        }
+
         if (!addicts.containsKey(player.getUniqueId())) {
             player.sendMessage(Component.text("Ты не лудоман.", NamedTextColor.GREEN));
             return true;
         }
         LudoData data = addicts.get(player.getUniqueId());
 
-        if (data.totalDeposited < 10) {
-            player.sendMessage(Component.text("Пока держишься... (" + data.totalDeposited + "/10)", NamedTextColor.YELLOW));
+        if (data.totalDeposited < minOreTrigger) {
+            player.sendMessage(Component.text("Пока держишься... (" + data.totalDeposited + "/" + minOreTrigger + ")", NamedTextColor.YELLOW));
             return true;
         }
 
@@ -330,6 +345,45 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         player.sendMessage(Component.text("Всего слито: ", NamedTextColor.GRAY).append(Component.text(data.totalDeposited, NamedTextColor.AQUA)));
         return true;
     }
+
+    private void openTopGui(Player player) {
+        List<LudoData> topList = addicts.values().stream()
+                .filter(d -> d.totalDeposited >= minOreTrigger)
+                .sorted((d1, d2) -> Integer.compare(d2.totalDeposited, d1.totalDeposited))
+                .limit(9)
+                .collect(Collectors.toList());
+
+        Inventory inv = Bukkit.createInventory(null, 9, TOP_TITLE);
+
+        int slot = 0;
+        for (LudoData data : topList) {
+            ItemStack skull = new ItemStack(Material.PLAYER_HEAD);
+            SkullMeta meta = (SkullMeta) skull.getItemMeta();
+
+            String pName = (data.playerName != null) ? data.playerName : "Неизвестный";
+            OfflinePlayer offPlayer = Bukkit.getOfflinePlayer(pName);
+            meta.setOwningPlayer(offPlayer);
+
+            meta.displayName(Component.text((slot + 1) + ". " + pName, NamedTextColor.GOLD, TextDecoration.BOLD));
+            List<Component> lore = new ArrayList<>();
+            lore.add(Component.text("Слито: ", NamedTextColor.GRAY).append(Component.text(data.totalDeposited, NamedTextColor.AQUA)));
+
+            if (data.percentage < 20) {
+                lore.add(Component.text("СТАТУС: ЛОМКА", NamedTextColor.RED, TextDecoration.BOLD));
+            } else {
+                lore.add(Component.text("СТАТУС: КАЙФУЕТ", NamedTextColor.GREEN));
+            }
+
+            meta.lore(lore);
+            skull.setItemMeta(meta);
+            inv.setItem(slot, skull);
+            slot++;
+        }
+
+        player.openInventory(inv);
+    }
+
+    // --- СОБЫТИЯ ---
 
     @EventHandler
     public void onPlace(BlockPlaceEvent e) {
@@ -353,7 +407,9 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         if (addicts.containsKey(e.getPlayer().getUniqueId())) {
-            if (addicts.get(e.getPlayer().getUniqueId()).totalDeposited >= 10) {
+            LudoData d = addicts.get(e.getPlayer().getUniqueId());
+            d.playerName = e.getPlayer().getName();
+            if (d.totalDeposited >= minOreTrigger) {
                 startLudoTask(e.getPlayer());
             }
         }
@@ -365,6 +421,8 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         if (t != null) t.cancel();
         saveAllData();
     }
+
+    // --- УТИЛИТЫ ---
 
     private void registerRecipe() {
         ItemStack item = new ItemStack(Material.BARREL);
@@ -383,9 +441,14 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         double percentage = 0;
         int totalDeposited = 0;
         long lastDepositTime = 0;
+        String playerName = "Unknown";
     }
 
     private void loadData() {
+        highSpeedMultiplier = getConfig().getDouble("high_speed_multiplier", 1.0);
+        withdrawalSpeedMultiplier = getConfig().getDouble("withdrawal_speed_multiplier", 1.0);
+        minOreTrigger = getConfig().getInt("min_ore_trigger", 10);
+
         if (getConfig().contains("barrels")) barrelLocations.addAll(getConfig().getStringList("barrels"));
         if (getConfig().contains("players")) {
             ConfigurationSection sec = getConfig().getConfigurationSection("players");
@@ -394,6 +457,7 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
                     LudoData d = new LudoData();
                     d.percentage = sec.getDouble(k + ".pct");
                     d.totalDeposited = sec.getInt(k + ".total");
+                    d.playerName = sec.getString(k + ".name", "Unknown");
                     addicts.put(UUID.fromString(k), d);
                 }
             }
@@ -401,11 +465,15 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
     }
 
     private void saveAllData() {
+        getConfig().set("high_speed_multiplier", highSpeedMultiplier);
+        getConfig().set("withdrawal_speed_multiplier", withdrawalSpeedMultiplier);
+        getConfig().set("min_ore_trigger", minOreTrigger);
         getConfig().set("barrels", new ArrayList<>(barrelLocations));
         getConfig().set("players", null);
         addicts.forEach((uuid, data) -> {
             getConfig().set("players." + uuid + ".pct", data.percentage);
             getConfig().set("players." + uuid + ".total", data.totalDeposited);
+            getConfig().set("players." + uuid + ".name", data.playerName);
         });
         saveConfig();
     }
