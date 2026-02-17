@@ -9,18 +9,22 @@ import org.bukkit.*;
 import org.bukkit.block.Barrel;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.Container;
+import org.bukkit.block.data.type.Hopper;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
-import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.*;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.ShapedRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -41,17 +45,15 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
     private final NamespacedKey BARREL_KEY = new NamespacedKey(this, "ludo_barrel");
     private final NamespacedKey PLACER_KEY = new NamespacedKey(this, "placer_uuid");
 
-    // Храним локации бочек для партиклов
+    private final Map<UUID, LudoData> addicts = new ConcurrentHashMap<>();
+    private final Map<UUID, ScheduledTask> playerTasks = new ConcurrentHashMap<>();
     private final Set<String> barrelLocations = ConcurrentHashMap.newKeySet();
 
-    // Данные игроков: UUID -> Объект с инфой (процент, сколько депнул)
-    private final Map<UUID, LudoData> addicts = new ConcurrentHashMap<>();
-
-    // Активные задачи (чтобы не спамить тасками)
-    private final Map<UUID, ScheduledTask> playerTasks = new ConcurrentHashMap<>();
-
-    // Настройки баланса
-    private final double DECAY_PER_SECOND = 0.4; // Сколько процентов уходит в секунду (примерно 4 минуты до ломки)
+    private final List<String> MESSAGES = List.of(
+            "РУКИ ТРЯСУТСЯ...", "ГДЕ АРЫ?!", "МНЕ НУЖНО ЕЩЕ...",
+            "ВСЕГО ОДИН СТАК...", "Я ОТЫГРАЮСЬ, ОБЕЩАЮ...", "ГОЛОСА В ГОЛОВЕ...",
+            "ПРОДАЙ ПОЧКУ - ДЕПНИ В БОЧКУ!", "БОЛЬ... ТОЛЬКО ДОДЕП СПАСЕТ..."
+    );
 
     @Override
     public void onEnable() {
@@ -62,163 +64,167 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         getServer().getPluginManager().registerEvents(this, this);
         getCommand("ludo").setExecutor(this);
 
-        // Партиклы для бочек (Глобальный шедулер раздает задачи регионам)
+        // Партиклы
         getServer().getGlobalRegionScheduler().runAtFixedRate(this, (task) -> {
             for (String locStr : barrelLocations) {
                 Location loc = strToLoc(locStr);
                 if (loc != null) {
                     Bukkit.getRegionScheduler().execute(this, loc, () -> {
                         if (loc.getWorld().isChunkLoaded(loc.getBlockX() >> 4, loc.getBlockZ() >> 4)) {
-                            loc.getWorld().spawnParticle(Particle.ENCHANT, loc.clone().add(0.5, 1.2, 0.5), 10, 0.3, 0.5, 0.3, 0.05);
-                            loc.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, loc.clone().add(0.5, 0.5, 0.5), 2, 0.4, 0.4, 0.4, 0.02);
+                            loc.getWorld().spawnParticle(Particle.ENCHANT, loc.clone().add(0.5, 1.2, 0.5), 5, 0.3, 0.5, 0.3, 0.05);
                         }
                     });
                 }
             }
-        }, 20L, 20L);
+        }, 40L, 40L);
 
-        // Перезапуск задач для онлайн игроков после релоада
         for (Player p : Bukkit.getOnlinePlayers()) {
-            if (addicts.containsKey(p.getUniqueId())) {
-                startLudoTask(p);
-            }
+            if (addicts.containsKey(p.getUniqueId())) startLudoTask(p);
         }
-
-        getLogger().info("LUDOMANIA v2: МЕХАНИКА ЛОМКИ ЗАГРУЖЕНА!");
     }
 
     @Override
     public void onDisable() {
         playerTasks.values().forEach(ScheduledTask::cancel);
-        playerTasks.clear();
         saveAllData();
     }
 
-    // --- КОМАНДА /LUDO ---
-    @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
-        if (!(sender instanceof Player player)) return true;
-
-        if (!addicts.containsKey(player.getUniqueId())) {
-            player.sendMessage(Component.text("Ты абсолютно чист! Не начинай...", NamedTextColor.GREEN));
-            return true;
-        }
-
-        LudoData data = addicts.get(player.getUniqueId());
-        NamedTextColor color = data.percentage > 50 ? NamedTextColor.GREEN : (data.percentage > 20 ? NamedTextColor.YELLOW : NamedTextColor.RED);
-
-        player.sendMessage(Component.text("===== СТАТУС ЛУДОМАНА =====", NamedTextColor.GOLD, TextDecoration.BOLD));
-        player.sendMessage(Component.text("Кайф: ", NamedTextColor.GRAY).append(Component.text(String.format("%.1f%%", data.percentage), color)));
-        player.sendMessage(Component.text("Слито в бочку: ", NamedTextColor.GRAY).append(Component.text(data.totalDeposited + " шт.", NamedTextColor.AQUA)));
-
-        if (data.percentage < 20) {
-            player.sendMessage(Component.text("ТЕБЕ СРОЧНО НУЖНО ДЕПНУТЬ!", NamedTextColor.DARK_RED, TextDecoration.BOLD));
-        } else {
-            player.sendMessage(Component.text("Пока держишься...", NamedTextColor.GRAY));
-        }
-        return true;
-    }
-
-    // --- СОБЫТИЯ ---
-
-    @EventHandler
-    public void onPlace(BlockPlaceEvent e) {
-        ItemStack hand = e.getItemInHand();
-        if (hand.getItemMeta() != null && hand.getItemMeta().getPersistentDataContainer().has(BARREL_KEY, PersistentDataType.BYTE)) {
-            Block b = e.getBlockPlaced();
-            if (b.getState() instanceof Barrel barrel) {
-                barrel.getPersistentDataContainer().set(BARREL_KEY, PersistentDataType.BYTE, (byte)1);
-                barrel.getPersistentDataContainer().set(PLACER_KEY, PersistentDataType.STRING, e.getPlayer().getUniqueId().toString());
-                barrel.update();
-            }
-            barrelLocations.add(locToStr(b.getLocation()));
-            saveAllData();
-            e.getPlayer().sendMessage(Component.text("КАЗИНО ОТКРЫТО! (Бочка установлена)", NamedTextColor.GOLD));
-        }
-    }
-
-    @EventHandler
-    public void onBreak(BlockBreakEvent e) {
-        String locStr = locToStr(e.getBlock().getLocation());
-        if (barrelLocations.contains(locStr)) {
-            barrelLocations.remove(locStr);
-            saveAllData();
-        }
-    }
+    // --- ЛОГИКА ДЕПОЗИТА ---
 
     @EventHandler
     public void onInventoryClick(InventoryClickEvent e) {
         if (!(e.getWhoClicked() instanceof Player player)) return;
-        if (!(e.getInventory().getHolder() instanceof Barrel barrel)) return;
 
-        PersistentDataContainer pdc = barrel.getPersistentDataContainer();
-        if (!pdc.has(BARREL_KEY, PersistentDataType.BYTE)) return;
+        Inventory clickedInv = e.getClickedInventory();
+        Inventory topInv = e.getView().getTopInventory();
 
-        ItemStack cursor = e.getCursor();
-        if (cursor == null || cursor.getType() != Material.DEEPSLATE_DIAMOND_ORE) return;
+        if (!(topInv.getHolder() instanceof Barrel barrel) || !isLudoBarrel(barrel)) return;
 
-        // ЛОГИКА ДЕПОЗИТА
-        if (cursor.getAmount() >= 10) {
-            Block blockUnder = barrel.getBlock().getRelative(BlockFace.DOWN);
-            if (blockUnder.getType() != Material.HOPPER) {
-                player.sendMessage(Component.text("Нужна воронка снизу для слива!", NamedTextColor.RED));
-                return;
+        if (clickedInv == topInv) {
+            ItemStack cursor = e.getCursor();
+            if (isValidOre(cursor)) {
+                if (processDeposit(player, barrel, cursor)) {
+                    e.setCursor(null);
+                    e.setCancelled(true);
+                } else {
+                    e.setCancelled(true);
+                }
             }
-
-            String ownerUUID = pdc.get(PLACER_KEY, PersistentDataType.STRING);
-            if (ownerUUID != null && ownerUUID.equals(player.getUniqueId().toString())) {
-                player.sendMessage(Component.text("В свою бочку депать нельзя! Ищи другого дилера!", NamedTextColor.RED));
-                return;
+        }
+        else if (e.getAction() == InventoryAction.MOVE_TO_OTHER_INVENTORY) {
+            ItemStack current = e.getCurrentItem();
+            if (isValidOre(current)) {
+                if (processDeposit(player, barrel, current)) {
+                    e.setCurrentItem(null);
+                    e.setCancelled(true);
+                } else {
+                    e.setCancelled(true);
+                }
             }
+        }
+    }
 
-            // ЗАБИРАЕМ ВСЕ, ЧТО В РУКЕ (или минимум 10, но логика "депнуть всё" веселее)
-            int amount = cursor.getAmount();
-            e.setCursor(null); // Забираем предмет
-            e.setCancelled(true);
+    @EventHandler
+    public void onHopperPickup(InventoryPickupItemEvent e) {
+        if (e.getInventory().getHolder() instanceof Container hopper) {
+            Item itemEntity = e.getItem();
+            ItemStack stack = itemEntity.getItemStack();
 
-            // ОБНОВЛЯЕМ ДАННЫЕ
-            LudoData data = addicts.getOrDefault(player.getUniqueId(), new LudoData());
+            if (!isValidOre(stack)) return;
 
-            // Если он был чист (percentage <= 0), сбрасываем счетчик депозитов новой сессии
-            if (data.percentage <= 0) {
+            if (hopper.getBlock().getBlockData() instanceof Hopper hopperData) {
+                Block targetBlock = hopper.getBlock().getRelative(hopperData.getFacing());
+                if (targetBlock.getState() instanceof Barrel barrel && isLudoBarrel(barrel)) {
+                    UUID throwerUUID = itemEntity.getThrower();
+                    if (throwerUUID != null) {
+                        Player thrower = Bukkit.getPlayer(throwerUUID);
+                        if (thrower != null) {
+                            if (processDeposit(thrower, barrel, stack)) {
+                                e.setCancelled(true);
+                                itemEntity.remove();
+                            } else {
+                                e.setCancelled(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- ГЛАВНАЯ ФУНКЦИЯ ДЕПОЗИТА ---
+
+    private boolean processDeposit(Player player, Barrel barrel, ItemStack stack) {
+        String ownerUUID = barrel.getPersistentDataContainer().get(PLACER_KEY, PersistentDataType.STRING);
+        if (ownerUUID != null && ownerUUID.equals(player.getUniqueId().toString())) {
+            player.sendMessage(Component.text("Нельзя играть в своем казино!", NamedTextColor.RED));
+            return false;
+        }
+
+        Block bankBlock = barrel.getBlock().getRelative(BlockFace.DOWN);
+        if (bankBlock.getType() != Material.HOPPER) {
+            player.sendMessage(Component.text("Казино сломано (нет воронки снизу)!", NamedTextColor.RED));
+            return false;
+        }
+
+        org.bukkit.block.Hopper bankHopper = (org.bukkit.block.Hopper) bankBlock.getState();
+
+        ItemStack toAdd = stack.clone();
+        HashMap<Integer, ItemStack> leftOver = bankHopper.getInventory().addItem(toAdd);
+
+        if (!leftOver.isEmpty()) {
+            player.sendMessage(Component.text("КАССА ПЕРЕПОЛНЕНА!", NamedTextColor.RED, TextDecoration.BOLD));
+            return false;
+        }
+
+        int amount = stack.getAmount();
+        LudoData data = addicts.getOrDefault(player.getUniqueId(), new LudoData());
+
+        long currentTime = System.currentTimeMillis();
+        boolean isAddicted = playerTasks.containsKey(player.getUniqueId()) || data.percentage > 0;
+
+        if (!isAddicted) {
+            // Если с последнего депа прошло больше 10 минут (600 сек * 1000)
+            if (currentTime - data.lastDepositTime > 600000) {
                 data.totalDeposited = 0;
             }
+        }
 
-            data.totalDeposited += amount;
-            data.percentage = 100.0; // Фуловый кайф
+        data.totalDeposited += amount;
+        data.lastDepositTime = currentTime;
+
+        // ПОРОГ ВХОДА: 10 РУДЫ
+        if (data.totalDeposited >= 10) {
+            data.percentage = 100.0;
             addicts.put(player.getUniqueId(), data);
 
-            // ВИЗУАЛ
-            player.playSound(player.getLocation(), Sound.BLOCK_AMETHYST_BLOCK_CHIME, 1f, 1f);
+            player.playSound(player.getLocation(), Sound.BLOCK_AMETHYST_BLOCK_CHIME, 1f, 1.5f);
             player.showTitle(Title.title(
-                    Component.text("ДЕПНУЛ!", NamedTextColor.GREEN),
-                    Component.text("Кайф восстановлен на 100%", NamedTextColor.AQUA)
+                    Component.text("ДЕПНУТО: " + amount, NamedTextColor.GREEN),
+                    Component.text("ВСЕГО: " + data.totalDeposited, NamedTextColor.AQUA)
             ));
 
-            // Запускаем таск, если его не было
-            if (!playerTasks.containsKey(player.getUniqueId())) {
-                startLudoTask(player);
-            }
+            if (!playerTasks.containsKey(player.getUniqueId())) startLudoTask(player);
+        } else {
+            addicts.put(player.getUniqueId(), data);
+            player.playSound(player.getLocation(), Sound.BLOCK_CHAIN_PLACE, 1f, 2.0f);
+            player.sendActionBar(Component.text("Депозит принят (" + data.totalDeposited + "/10 для активации)", NamedTextColor.GRAY));
         }
+
+        return true;
     }
 
-    @EventHandler
-    public void onJoin(PlayerJoinEvent e) {
-        if (addicts.containsKey(e.getPlayer().getUniqueId())) {
-            startLudoTask(e.getPlayer());
-        }
+    private boolean isValidOre(ItemStack item) {
+        return item != null && item.getType() == Material.DEEPSLATE_DIAMOND_ORE;
     }
 
-    @EventHandler
-    public void onQuit(PlayerQuitEvent e) {
-        ScheduledTask task = playerTasks.remove(e.getPlayer().getUniqueId());
-        if (task != null) task.cancel();
-        saveAllData(); // Сохраняем прогресс (или регресс)
+    private boolean isLudoBarrel(Barrel b) {
+        return b.getPersistentDataContainer().has(BARREL_KEY, PersistentDataType.BYTE);
     }
 
-    // --- ЛОГИКА ЛОМКИ (EntityScheduler) ---
+    // --- ЛОГИКА ЛОМКИ И ЭФФЕКТОВ ---
+
     private void startLudoTask(Player player) {
-        // Запускаем повторяющуюся задачу раз в секунду (20 тиков)
         ScheduledTask task = player.getScheduler().runAtFixedRate(this, (t) -> {
             UUID uid = player.getUniqueId();
             if (!addicts.containsKey(uid)) {
@@ -229,60 +235,143 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
 
             LudoData data = addicts.get(uid);
 
-            // Снижаем процент
-            data.percentage -= DECAY_PER_SECOND;
-
-            // 1. СТАДИЯ: ИСЦЕЛЕНИЕ
-            if (data.percentage <= 0) {
-                addicts.remove(uid);
-                player.sendMessage(Component.text("Ты переборол ломку! Ты свободен...", NamedTextColor.GREEN, TextDecoration.BOLD));
-                player.playSound(player.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
-                player.resetTitle();
+            if (data.totalDeposited < 10) {
                 t.cancel();
                 playerTasks.remove(uid);
                 return;
             }
 
-            // 2. СТАДИЯ: ЛОМКА (Меньше 20%)
+            double decay;
+            if (data.percentage > 20) {
+                decay = 0.4 + (data.totalDeposited / 2000.0);
+            } else {
+                decay = 0.5 / (1.0 + (data.totalDeposited / 300.0));
+            }
+
+            data.percentage -= decay;
+
+            if (data.percentage <= 0) {
+                addicts.remove(uid);
+                player.showTitle(Title.title(
+                        Component.text("СВОБОДА..."),
+                        Component.text("Ты чист"),
+                        Title.Times.times(Duration.ofMillis(500), Duration.ofMillis(3000), Duration.ofMillis(1000))
+                ));
+                player.sendMessage(Component.text("Ты переборол зависимость.", NamedTextColor.GREEN));
+                t.cancel();
+                playerTasks.remove(uid);
+                return;
+            }
+
             if (data.percentage < 20) {
-                player.sendActionBar(Component.text("ЛОМКА: " + String.format("%.1f%%", data.percentage), NamedTextColor.DARK_RED));
-
-                // Эффекты
-                if (data.percentage < 10) {
-                    player.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 40, 0, false, false));
-                    player.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 40, 2, false, false));
-                }
-                player.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, 100, 0, false, false));
-
-                // Звуки и сообщения (рандомно)
-                if (ThreadLocalRandom.current().nextInt(100) < 5) {
-                    player.sendMessage(Component.text("РУКИ ТРЯСУТСЯ... НУЖНО ДЕПНУТЬ...", NamedTextColor.RED));
-                    player.playSound(player.getLocation(), Sound.ENTITY_WARDEN_HEARTBEAT, 1f, 1.5f);
-                }
-            }
-            // 3. СТАДИЯ: НОРМА/КАЙФ (Больше 20%)
-            else {
-                player.sendActionBar(Component.text("Состояние: " + String.format("%.1f%%", data.percentage), NamedTextColor.GREEN));
-                if (data.percentage > 80) {
-                    // Бонус за свежий деп
-                    player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 40, 0, false, false));
-                }
+                applyWithdrawalEffects(player, data.totalDeposited);
             }
 
-        }, null, 20L, 20L); // Delay 1s, Period 1s
+        }, null, 20L, 20L);
 
         playerTasks.put(player.getUniqueId(), task);
     }
 
-    // --- КРАФТ ---
+    private void applyWithdrawalEffects(Player p, int total) {
+        int chance = ThreadLocalRandom.current().nextInt(100);
+        int severity = total < 200 ? 0 : (total < 1000 ? 1 : 2);
+
+
+        PotionEffect currentNausea = p.getPotionEffect(PotionEffectType.NAUSEA);
+
+        if (currentNausea == null || currentNausea.getDuration() < 100) {
+            p.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, 300, 0, false, false));
+        }
+
+        // Слепота для средних и жестких (шанс 10%)
+        if (severity >= 1 && chance < 10) {
+            p.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 60, 0, false, false));
+        }
+
+        // Рандомные приходы (5% в секунду)
+        if (chance < 5) {
+            String msg = MESSAGES.get(ThreadLocalRandom.current().nextInt(MESSAGES.size()));
+            p.sendMessage(Component.text(msg, NamedTextColor.DARK_RED, TextDecoration.BOLD));
+            p.playSound(p.getLocation(), Sound.ENTITY_WARDEN_HEARTBEAT, 1f, 0.5f);
+
+            if (severity == 2) {
+                p.damage(1.0);
+                p.playSound(p.getLocation(), Sound.ENTITY_GHAST_SCREAM, 0.5f, 0.5f);
+                p.showTitle(Title.title(
+                        Component.text("☠", NamedTextColor.RED),
+                        Component.text("БОЛЬ НЕ УЙДЕТ", NamedTextColor.DARK_RED),
+                        Title.Times.times(Duration.ZERO, Duration.ofMillis(1000), Duration.ofMillis(500))
+                ));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 60, 1, false, false));
+                p.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, 60, 1, false, false));
+            }
+        }
+    }
+
+    // --- ОСТАЛЬНОЕ ---
+
+    @Override
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
+        if (!(sender instanceof Player player)) return true;
+        if (!addicts.containsKey(player.getUniqueId())) {
+            player.sendMessage(Component.text("Ты не лудоман.", NamedTextColor.GREEN));
+            return true;
+        }
+        LudoData data = addicts.get(player.getUniqueId());
+
+        if (data.totalDeposited < 10) {
+            player.sendMessage(Component.text("Пока держишься... (" + data.totalDeposited + "/10)", NamedTextColor.YELLOW));
+            return true;
+        }
+
+        NamedTextColor color = data.percentage > 50 ? NamedTextColor.GREEN : (data.percentage > 20 ? NamedTextColor.YELLOW : NamedTextColor.RED);
+        player.sendMessage(Component.text("--- СТАТУС ---", NamedTextColor.DARK_GRAY));
+        player.sendMessage(Component.text("Состояние: ", NamedTextColor.GRAY).append(Component.text(String.format("%.1f%%", data.percentage), color)));
+        player.sendMessage(Component.text("Всего слито: ", NamedTextColor.GRAY).append(Component.text(data.totalDeposited, NamedTextColor.AQUA)));
+        return true;
+    }
+
+    @EventHandler
+    public void onPlace(BlockPlaceEvent e) {
+        ItemStack hand = e.getItemInHand();
+        if (hand.getItemMeta() != null && hand.getItemMeta().getPersistentDataContainer().has(BARREL_KEY, PersistentDataType.BYTE)) {
+            Barrel barrel = (Barrel) e.getBlockPlaced().getState();
+            barrel.getPersistentDataContainer().set(BARREL_KEY, PersistentDataType.BYTE, (byte)1);
+            barrel.getPersistentDataContainer().set(PLACER_KEY, PersistentDataType.STRING, e.getPlayer().getUniqueId().toString());
+            barrel.update();
+            barrelLocations.add(locToStr(e.getBlock().getLocation()));
+            saveAllData();
+            e.getPlayer().sendMessage(Component.text("БОЧКА ПОСТАВЛЕНА!", NamedTextColor.GOLD));
+        }
+    }
+
+    @EventHandler
+    public void onBreak(BlockBreakEvent e) {
+        if (barrelLocations.remove(locToStr(e.getBlock().getLocation()))) saveAllData();
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        if (addicts.containsKey(e.getPlayer().getUniqueId())) {
+            if (addicts.get(e.getPlayer().getUniqueId()).totalDeposited >= 10) {
+                startLudoTask(e.getPlayer());
+            }
+        }
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        ScheduledTask t = playerTasks.remove(e.getPlayer().getUniqueId());
+        if (t != null) t.cancel();
+        saveAllData();
+    }
+
     private void registerRecipe() {
         ItemStack item = new ItemStack(Material.BARREL);
         ItemMeta meta = item.getItemMeta();
-        meta.displayName(Component.text("БОЧКА ЛУДОМАНА", NamedTextColor.GOLD, TextDecoration.BOLD));
+        meta.displayName(Component.text("БОЧКА ЛУДОМАНА", NamedTextColor.LIGHT_PURPLE));
         meta.getPersistentDataContainer().set(BARREL_KEY, PersistentDataType.BYTE, (byte) 1);
-        meta.lore(List.of(Component.text("Поставь и жди клиентов...", NamedTextColor.GRAY)));
         item.setItemMeta(meta);
-
         ShapedRecipe recipe = new ShapedRecipe(new NamespacedKey(this, "ludo_barrel_recipe"), item);
         recipe.shape("DDD", "DBD", "DDD");
         recipe.setIngredient('D', Material.DIAMOND_ORE);
@@ -290,63 +379,43 @@ public class LudoPlugin extends JavaPlugin implements Listener, CommandExecutor 
         Bukkit.addRecipe(recipe);
     }
 
-    // --- СОХРАНЕНИЕ/ЗАГРУЗКА ---
-
-    // Класс-обертка для данных
     private static class LudoData {
         double percentage = 0;
         int totalDeposited = 0;
+        long lastDepositTime = 0;
     }
 
     private void loadData() {
-        // Бочки
-        if (getConfig().contains("barrels")) {
-            barrelLocations.addAll(getConfig().getStringList("barrels"));
-        }
-        // Игроки
+        if (getConfig().contains("barrels")) barrelLocations.addAll(getConfig().getStringList("barrels"));
         if (getConfig().contains("players")) {
             ConfigurationSection sec = getConfig().getConfigurationSection("players");
             if (sec != null) {
-                for (String uuidStr : sec.getKeys(false)) {
-                    try {
-                        UUID uuid = UUID.fromString(uuidStr);
-                        LudoData data = new LudoData();
-                        data.percentage = sec.getDouble(uuidStr + ".pct");
-                        data.totalDeposited = sec.getInt(uuidStr + ".total");
-                        addicts.put(uuid, data);
-                    } catch (Exception ignored) {}
+                for (String k : sec.getKeys(false)) {
+                    LudoData d = new LudoData();
+                    d.percentage = sec.getDouble(k + ".pct");
+                    d.totalDeposited = sec.getInt(k + ".total");
+                    addicts.put(UUID.fromString(k), d);
                 }
             }
         }
     }
 
     private void saveAllData() {
-        // Бочки
         getConfig().set("barrels", new ArrayList<>(barrelLocations));
-
-        // Игроки
-        getConfig().set("players", null); // Очистка старого
-        for (Map.Entry<UUID, LudoData> entry : addicts.entrySet()) {
-            String path = "players." + entry.getKey().toString();
-            getConfig().set(path + ".pct", entry.getValue().percentage);
-            getConfig().set(path + ".total", entry.getValue().totalDeposited);
-        }
+        getConfig().set("players", null);
+        addicts.forEach((uuid, data) -> {
+            getConfig().set("players." + uuid + ".pct", data.percentage);
+            getConfig().set("players." + uuid + ".total", data.totalDeposited);
+        });
         saveConfig();
     }
 
-    // Вспомогательные
-    private String locToStr(Location loc) {
-        return loc.getWorld().getName() + "," + loc.getBlockX() + "," + loc.getBlockY() + "," + loc.getBlockZ();
-    }
+    private String locToStr(Location loc) { return loc.getWorld().getName() + "," + loc.getBlockX() + "," + loc.getBlockY() + "," + loc.getBlockZ(); }
 
     private Location strToLoc(String str) {
         try {
-            String[] parts = str.split(",");
-            World w = Bukkit.getWorld(parts[0]);
-            if (w == null) return null;
-            return new Location(w, Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), Integer.parseInt(parts[3]));
-        } catch (Exception e) {
-            return null;
-        }
+            String[] p = str.split(",");
+            return new Location(Bukkit.getWorld(p[0]), Integer.parseInt(p[1]), Integer.parseInt(p[2]), Integer.parseInt(p[3]));
+        } catch (Exception e) { return null; }
     }
 }
