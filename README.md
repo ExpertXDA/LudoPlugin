@@ -1,4 +1,4 @@
-# 🎰 LUDOMANIA Configuration v4.1
+# 🎰 LUDOMANIA Configuration v1.1
 
 ---
 
